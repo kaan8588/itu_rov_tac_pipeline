@@ -51,6 +51,17 @@ from collections import deque
 from dataclasses import dataclass
 from pymavlink import mavutil
 
+# ROS2 importları (opsiyonel — yoksa ROS2 devre dışı kalır)
+try:
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import Image
+    from cv_bridge import CvBridge
+    ROS2_AVAILABLE = True
+except ImportError:
+    ROS2_AVAILABLE = False
+    print("⚠️  ROS2 kütüphaneleri bulunamadı — ROS2 yayını devre dışı.")
+
 os.environ['MAVLINK20'] = '1'
 
 FORCE_ARM_MAGIC = 21196
@@ -78,14 +89,14 @@ class Config:
     spd_slow: int       = 60
     spd_search: int     = 80
     spd_search_yaw: int = 60
-    spd_yaw: int        = 120
+    spd_yaw: int        = 150
     spd_lateral: int    = 0   # Yengeç yürüyüşü tamamen iptal edildi
     spd_soft_lat: int   = 0   # Yengeç yürüyüşü iptal
     spd_surface: int    = 150
 
-    gain: float      = 0.4   # 45° kamera: perspektif kayması daha belirgin, kazanç düşürüldü (0.5 → 0.4)
-    dead_zone: float = 0.05  # 45° kamera: boru alt kısımda geniş görünür, tolerans artırıldı (0.05 → 0.12)
-    turn_zone: float = 0.25  # 45° kamera: viraj bölgesi genişletildi (0.20 → 0.30)
+    gain: float      = 0.7   # Dönüş sertliği artırıldı (0.4 -> 0.7)
+    dead_zone: float = 0.05  # 45° kamera: boru alt kısımda geniş görünür
+    turn_zone: float = 0.25  # Viraj bölgesi
 
     # İleri ve Dönüş yönünü tersine çevirmek için (True/False)
     rev_x: bool = False
@@ -121,6 +132,8 @@ class Config:
     show_display: bool = True
     stream_on: bool    = True
     stream_port: int   = 5000
+    ros2_on: bool      = True   # ROS2 image topic yayını
+    show_all_masks: bool = True  # 2x2 debug ızgara ekranı
 
 
 # ══════════════════════════════════════════════════════════════
@@ -272,7 +285,12 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 # GÖRÜNTÜ İŞLEME
 # ══════════════════════════════════════════════════════════════
 def detect_pipe(frame, lo, hi, min_area):
-    """Dual-pass boru algılama. Geçiş 1: yakın, Geçiş 2: uzak."""
+    """Dual-pass boru algılama. Geçiş 1: yakın, Geçiş 2: uzak.
+    
+    Returns:
+        mask, contour, rect, center, angle, debug_masks
+        debug_masks = dict with 'hsv_raw', 'exclude', 'morphed' keys
+    """
     # CLAHE kontrast normalizasyonu
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
@@ -298,6 +316,9 @@ def detect_pipe(frame, lo, hi, min_area):
     exclude = cv2.bitwise_or(water_mask,
                              cv2.bitwise_or(skin_mask, gray_mask))
 
+    # Debug için ham HSV maskesi
+    hsv_raw_mask = cv2.inRange(hsv, lo, hi)
+
     # Geçiş 1: yakın boru (ölçülen: H:14-25, S:181-255, V:201-255)
     # Geçiş 2: uzak boru  (ölçülen: H:32-80, S:147-245, V:109-207)
     passes = [
@@ -313,13 +334,15 @@ def detect_pipe(frame, lo, hi, min_area):
 
     for p_lo, p_hi, p_min in passes:
         mask = cv2.inRange(hsv, p_lo, p_hi)
-        mask = cv2.bitwise_and(mask, mask,
+        # Hariç tutulan renkleri çıkar
+        mask_after_exclude = cv2.bitwise_and(mask, mask,
                                mask=cv2.bitwise_not(exclude))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k_small, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_mid,   iterations=2)
-        mask = cv2.dilate(mask, k_small, iterations=1)
+        # Morfolojik işlemler
+        mask_morphed = cv2.morphologyEx(mask_after_exclude, cv2.MORPH_OPEN,  k_small, iterations=1)
+        mask_morphed = cv2.morphologyEx(mask_morphed, cv2.MORPH_CLOSE, k_mid,   iterations=2)
+        mask_morphed = cv2.dilate(mask_morphed, k_small, iterations=1)
 
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+        cnts, _ = cv2.findContours(mask_morphed, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
         if not cnts:
             continue
@@ -350,19 +373,26 @@ def detect_pipe(frame, lo, hi, min_area):
             (rcx, rcy), (w, h), ang = rect
 
             # ── 45° Kamera Perspektif Düzeltmesi ──────────────
-            # Borunun rect merkezini değil, alt yarısının (araca en yakın)
-            # X ortalamasını hedef al. Bu sayede ilerideki viraj aracı
-            # erken döndürmez, sadece hemen altındaki boruya sadık kalır.
-            bottom_points = best[best[:, 0, 1] > rcy]  # Merkezin altındaki kontur noktaları
+            bottom_points = best[best[:, 0, 1] > rcy]
             if len(bottom_points) > 0:
-                cx = np.mean(bottom_points[:, 0, 0])  # Alt noktaların X ortalaması
-                cy = np.max(bottom_points[:, 0, 1])    # En alt Y noktası
+                cx = np.mean(bottom_points[:, 0, 0])
+                cy = np.max(bottom_points[:, 0, 1])
             else:
-                cx, cy = rcx, rcy  # Fallback: rect merkezi
+                cx, cy = rcx, rcy
 
-            return mask, best, rect, (int(cx), int(cy)), ang
+            debug_masks = {
+                'hsv_raw': hsv_raw_mask,
+                'exclude': exclude,
+                'morphed': mask_morphed,
+            }
+            return mask_morphed, best, rect, (int(cx), int(cy)), ang, debug_masks
 
-    return fallback_mask, None, None, None, 0.0
+    debug_masks = {
+        'hsv_raw': hsv_raw_mask,
+        'exclude': exclude,
+        'morphed': fallback_mask,
+    }
+    return fallback_mask, None, None, None, 0.0, debug_masks
 
 
 def build_aruco_detector(dict_id):
@@ -419,8 +449,9 @@ def detect_aruco(frame, mask, detector, clahe):
 
 
 def draw_debug(frame, mask, contour, rect, center, angle,
-               state, err, ordered, corners, ids, cfg):
-    """HUD overlay çizimi."""
+               state, err, ordered, corners, ids, cfg,
+               debug_masks=None):
+    """HUD overlay çizimi + opsiyonel 2x2 debug ızgara."""
     fw, fh = cfg.frame_w, cfg.frame_h
     vis = frame.copy()
 
@@ -492,14 +523,48 @@ def draw_debug(frame, mask, contour, rect, center, angle,
     cv2.putText(vis, f"IDs: {ids_str}", (8, fh - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 255, 150), 1, cv2.LINE_AA)
 
-    # Maske thumbnail (sağ alt köşe)
-    th2, tw2 = fh // 4, fw // 4
-    thumb = cv2.resize(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), (tw2, th2))
-    cv2.putText(thumb, "MASKE", (4, 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
-    vis[fh - th2:fh, fw - tw2:fw] = thumb
+    # ── 2x2 Debug Izgara Görünümü ─────────────────────────────
+    # Eğer debug_masks varsa ve show_all_masks aktifse,
+    # 4'lü ızgara oluştur: [Orijinal | HSV Maskesi]
+    #                      [Morfoloji | Sonuç HUD  ]
+    if cfg.show_all_masks and debug_masks is not None:
+        def _label(img, text, color=(0, 220, 255)):
+            """Görüntünün sol üst köşesine etiket yaz."""
+            cv2.rectangle(img, (0, 0), (len(text)*10 + 10, 22), (0, 0, 0), -1)
+            cv2.putText(img, text, (5, 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+            return img
 
-    return vis
+        def _gray2bgr(g):
+            return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+
+        # Sol üst: Orijinal kare
+        tile_orig = frame.copy()
+        _label(tile_orig, "ORIJINAL", (255, 255, 255))
+
+        # Sağ üst: Ham HSV maskesi (renk filtresi sonucu, morfoloji öncesi)
+        tile_hsv = _gray2bgr(debug_masks.get('hsv_raw', mask))
+        _label(tile_hsv, "HSV MASKE", (0, 255, 255))
+
+        # Sol alt: Morfoloji sonrası maske + hariç tutulan bölgeler kırmızı
+        tile_morph = _gray2bgr(debug_masks.get('morphed', mask))
+        # Hariç tutulan bölgeleri kırmızı ile göster
+        excl = debug_masks.get('exclude', np.zeros_like(mask))
+        tile_morph[excl > 0] = (0, 0, 180)  # Kırmızı: hariç tutulan
+        _label(tile_morph, "MORFOLOJI + HARIC", (0, 180, 255))
+
+        # Sağ alt: Sonuç HUD (zaten çizilmiş olan vis)
+        tile_hud = vis.copy()
+        _label(tile_hud, "SONUC HUD", (80, 255, 80))
+
+        # 2x2 ızgara birleştir
+        top_row = np.hstack([tile_orig, tile_hsv])
+        bot_row = np.hstack([tile_morph, tile_hud])
+        grid = np.vstack([top_row, bot_row])
+
+        return vis, grid
+
+    return vis, None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -577,6 +642,28 @@ class TacAutonomous:
         self._last_y = 0
         self._last_z = 500
         self._last_r = 0
+
+        # ── ROS2 Node & Publisher ─────────────────────────────
+        self.ros2_node = None
+        self.ros2_bridge = None
+        self.ros2_pub_raw = None
+        self.ros2_pub_debug = None
+        if cfg.ros2_on and ROS2_AVAILABLE:
+            try:
+                if not rclpy.ok():
+                    rclpy.init()
+                self.ros2_node = rclpy.create_node('tac_autonomous')
+                self.ros2_bridge = CvBridge()
+                self.ros2_pub_raw = self.ros2_node.create_publisher(
+                    Image, '/tac/camera/image_raw', 10)
+                self.ros2_pub_debug = self.ros2_node.create_publisher(
+                    Image, '/tac/camera/image_debug', 10)
+                print("🤖 ROS2 yayıncıları başlatıldı:")
+                print("   📷 /tac/camera/image_raw")
+                print("   🖥️  /tac/camera/image_debug")
+            except Exception as e:
+                print(f"⚠️  ROS2 başlatılamadı: {e}")
+                self.ros2_node = None
 
         # Web yayın sunucusu
         self.server = None
@@ -855,7 +942,7 @@ class TacAutonomous:
                         frame = cv2.flip(frame, cfg.flip)  # Kamerayı istenilen eksende çevir
 
                     # ── Görüntü işleme ──────────────────────
-                    mask, contour, rect, center, angle = detect_pipe(
+                    mask, contour, rect, center, angle, debug_masks = detect_pipe(
                         frame, self.lo, self.hi, cfg.min_area)
 
                     # Pipe lost sayacı
@@ -883,9 +970,22 @@ class TacAutonomous:
                         break
 
                     # ── Debug görsel & Yayın ─────────────────
-                    vis = draw_debug(frame, mask, contour, rect, center,
+                    vis, grid = draw_debug(frame, mask, contour, rect, center,
                                      angle, self.state, self.last_err,
-                                     ordered, corners, ids, cfg)
+                                     ordered, corners, ids, cfg,
+                                     debug_masks=debug_masks)
+
+                    # ROS2 yayını
+                    if self.ros2_node is not None:
+                        try:
+                            # Ham kamera görüntüsü
+                            raw_msg = self.ros2_bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+                            self.ros2_pub_raw.publish(raw_msg)
+                            # Debug HUD görüntüsü
+                            debug_msg = self.ros2_bridge.cv2_to_imgmsg(vis, encoding='bgr8')
+                            self.ros2_pub_debug.publish(debug_msg)
+                        except Exception as e:
+                            pass  # ROS2 hatası döngüyü durdurmasın
 
                     # Web yayınına gönder
                     if cfg.stream_on:
@@ -900,10 +1000,14 @@ class TacAutonomous:
                             MJPEGStreamer.server_err = self.last_err
                             MJPEGStreamer.server_pipe = (center is not None)
 
-                    # Yerel ekran (SSH korumalı)
+                    # Yerel ekran — Otomatik açılır
                     if cfg.show_display:
                         try:
-                            #cv2.imshow("TAC Autonomous", vis)
+                            # 2x2 debug ızgara (tüm maskeler)
+                            if grid is not None:
+                                cv2.imshow("TAC Debug Maskeleri", grid)
+                            # Ana HUD penceresi
+                            cv2.imshow("TAC Autonomous", vis)
                             k = cv2.waitKey(1) & 0xFF
                             if k == ord('q'):
                                 print("Çıkılıyor...")
@@ -937,6 +1041,12 @@ class TacAutonomous:
                     0, 0, 0, 0, 0, 0, 0, 0)
             cap.release()
             cv2.destroyAllWindows()
+            # ROS2 temizliği
+            if self.ros2_node is not None:
+                try:
+                    self.ros2_node.destroy_node()
+                except Exception:
+                    pass
             print("Bitti.")
 
     def _print_result(self, ordered):
@@ -981,6 +1091,10 @@ def parse_args():
                     help="Yerel pencereyi devre dışı bırak")
     ap.add_argument("--no-stream",   action="store_true",
                     help="Web yayınını devre dışı bırak")
+    ap.add_argument("--no-ros2",     action="store_true",
+                    help="ROS2 yayınını devre dışı bırak")
+    ap.add_argument("--no-masks",    action="store_true",
+                    help="2x2 debug maskeleme penceresini devre dışı bırak")
     ap.add_argument("--port",        type=int, default=5000,
                     help="Web yayın portu")
     ap.add_argument("--dry-run",     action="store_true",
@@ -1013,6 +1127,8 @@ def main():
     cfg.surface_on_done = not args.no_surface
     cfg.show_display    = not args.no_display
     cfg.stream_on       = not args.no_stream
+    cfg.ros2_on         = not args.no_ros2
+    cfg.show_all_masks  = not args.no_masks
     cfg.stream_port     = args.port
     cfg.dry_run         = args.dry_run
     
@@ -1039,6 +1155,13 @@ def main():
 
     bot = TacAutonomous(cfg)
     bot.run()
+
+    # ROS2 kapatma
+    if ROS2_AVAILABLE:
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
