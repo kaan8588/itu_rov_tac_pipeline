@@ -29,6 +29,12 @@ Hareket Eksen Referansı (manual_control_send):
   y  : sağ/sol        -1000..+1000  (+ = sağa kay)
   z  : dikey          0..1000       (500 = dur)
   r  : yaw            -1000..+1000  (+ = sağa dön)
+
+
+  Eğer araç hâlâ çok yalpalarsa → gain'i düşür
+Eğer araç virajlara geç tepki veriyorsa → dead_zone'u düşür
+Eğer araç virajlarda çok yavaşlıyorsa → turn_zone'u düşür
+
 """
 
 import cv2
@@ -65,9 +71,9 @@ class Config:
 
     # ── Boru Algılama ─────────────────────────────────────────
     min_area: int  = 200
-    yaw_thr: float = 1.5  # 3.0'dan düşürüldü: en ufak açı bozukluğunda bile anında dönmeye başlar
+    yaw_thr: float = 3.0  # Açı eşiği: bu dereceden küçük sapmalar görmezden gelinir
 
-    # ── Hareket Güçleri (ArduSub Fisheye / Direksiyon Mantığı) ──
+    # ── Hareket Güçleri (ArduSub / 45° Aşağı Kamera Direksiyon Mantığı) ──
     spd_forward: int    = 100
     spd_slow: int       = 60
     spd_search: int     = 80
@@ -77,13 +83,17 @@ class Config:
     spd_soft_lat: int   = 0   # Yengeç yürüyüşü iptal
     spd_surface: int    = 150
 
-    gain: float      = 0.5   # Orantısal direksiyon kazancı
-    dead_zone: float = 0.05  # Merkez deadzone %5
-    turn_zone: float = 0.20  # Viraj başlangıç bölgesi
+    gain: float      = 0.4   # 45° kamera: perspektif kayması daha belirgin, kazanç düşürüldü (0.5 → 0.4)
+    dead_zone: float = 0.05  # 45° kamera: boru alt kısımda geniş görünür, tolerans artırıldı (0.05 → 0.12)
+    turn_zone: float = 0.25  # 45° kamera: viraj bölgesi genişletildi (0.20 → 0.30)
 
     # İleri ve Dönüş yönünü tersine çevirmek için (True/False)
     rev_x: bool = False
     rev_r: bool = False
+
+    # ── 45° Kamera Ayarları ───────────────────────────────────
+    # Borunun alt kısmını (araca en yakın) hedef alarak perspektif hatasını önler
+    bottom_roi_ratio: float = 0.6  # Ekranın alt %60'ını hedef ROI olarak kullan
 
     # ── Görev ─────────────────────────────────────────────────
     aruco_dict: int    = cv2.aruco.DICT_ARUCO_ORIGINAL
@@ -96,7 +106,7 @@ class Config:
     camera: object = 0
     frame_w: int   = 640
     frame_h: int   = 360
-    smooth_n: int  = 3  # 8'den 3'e düşürüldü: Görüntü yumuşatmasını azaltarak fiziksel sinyal gecikmesini (gecikmeli dönüşü) anında ortadan kaldırır
+    smooth_n: int  = 2  # 45° kamera: boru hemen altta, gecikme toleransı yok (3 → 2)
 
     surface_on_done: bool = True
     surface_secs: float   = 8.0
@@ -337,7 +347,19 @@ def detect_pipe(frame, lo, hi, min_area):
         if valid:
             best = max(valid, key=cv2.contourArea)
             rect = cv2.minAreaRect(best)
-            (cx, cy), (w, h), ang = rect
+            (rcx, rcy), (w, h), ang = rect
+
+            # ── 45° Kamera Perspektif Düzeltmesi ──────────────
+            # Borunun rect merkezini değil, alt yarısının (araca en yakın)
+            # X ortalamasını hedef al. Bu sayede ilerideki viraj aracı
+            # erken döndürmez, sadece hemen altındaki boruya sadık kalır.
+            bottom_points = best[best[:, 0, 1] > rcy]  # Merkezin altındaki kontur noktaları
+            if len(bottom_points) > 0:
+                cx = np.mean(bottom_points[:, 0, 0])  # Alt noktaların X ortalaması
+                cy = np.max(bottom_points[:, 0, 1])    # En alt Y noktası
+            else:
+                cx, cy = rcx, rcy  # Fallback: rect merkezi
+
             return mask, best, rect, (int(cx), int(cy)), ang
 
     return fallback_mask, None, None, None, 0.0
@@ -664,6 +686,12 @@ class TacAutonomous:
 
     # ── Kontrol hesabı ────────────────────────────────────────
     def _compute_control(self, center, angle, fwd_spd):
+        """45° aşağı bakan kamera için optimize edilmiş kontrol hesabı.
+        
+        Perspektif düzeltmesi: detect_pipe zaten borunun alt merkezini
+        (araca en yakın kısmını) döndürüyor, burada sadece X hatasını
+        hesaplayıp direksiyon kırıyoruz.
+        """
         cfg = self.cfg
         raw_err = center[0] - cfg.frame_w // 2
         s_err   = self.smoother.update(raw_err)
@@ -673,7 +701,7 @@ class TacAutonomous:
         fw = cfg.frame_w
         dead_p = int(fw * cfg.dead_zone)
 
-        # Yan (Lateral) Yürüyüş İptal - Kamera İleri Baktığı İçin
+        # Yan (Lateral) Yürüyüş İptal — 45° kamerada yaw ile hizalanıyor
         y = 0  
 
         # -- Direksiyon (Proportional Yaw) Mantığı --
@@ -691,7 +719,7 @@ class TacAutonomous:
             if turn_power < -cfg.spd_yaw: turn_power = -cfg.spd_yaw
             r = turn_power
 
-        # -- Dinamik Frenleme Sitemi (Araba Mantığı) --
+        # -- Dinamik Frenleme Sistemi (Araba Mantığı) --
         # Direksiyon (r) ne kadar çok kırılmışsa, ileri fırlamamak için gazı o kadar çok kes
         turn_ratio = abs(r) / max(1, cfg.spd_yaw)  # 0 ile 1 arası
         
