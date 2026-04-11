@@ -81,6 +81,10 @@ class Config:
     dead_zone: float = 0.05  # Merkez deadzone %5
     turn_zone: float = 0.20  # Viraj başlangıç bölgesi
 
+    # İleri ve Dönüş yönünü tersine çevirmek için (True/False)
+    rev_x: bool = False
+    rev_r: bool = False
+
     # ── Görev ─────────────────────────────────────────────────
     aruco_dict: int    = cv2.aruco.DICT_ARUCO_ORIGINAL
     aruco_confirm: int = 3
@@ -167,32 +171,58 @@ class MJPEGStreamer(http.server.BaseHTTPRequestHandler):
     """Tarayıcıdan http://ROV_IP:5000 ile canlı HUD izleme."""
     server_frame = None
     server_lock  = threading.Lock()
+    server_x = 0
+    server_y = 0
+    server_z = 500
+    server_r = 0
+    server_state = "INIT"
+    server_err = 0
+    server_pipe = False
+
+    # Dashboard HTML'ini dosyadan yükle
+    _dashboard_html = None
+
+    @classmethod
+    def _load_dashboard(cls):
+        if cls._dashboard_html is not None:
+            return cls._dashboard_html
+        html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'dashboard.html')
+        try:
+            with open(html_path, 'r', encoding='utf-8') as f:
+                cls._dashboard_html = f.read()
+        except FileNotFoundError:
+            cls._dashboard_html = "<html><body><h1>dashboard.html bulunamadi!</h1></body></html>"
+        return cls._dashboard_html
 
     def log_message(self, format, *args):
-        pass  # HTTP loglarını sustur
+        pass
 
     def do_GET(self):
         if self.path == '/':
             self.send_response(200)
-            self.send_header('Content-type', 'text/html')
+            self.send_header('Content-type', 'text/html; charset=utf-8')
             self.end_headers()
-            html = """
-            <html>
-                <head>
-                    <title>ITÜROV Otonom Boru HUD</title>
-                    <style>
-                        body { background-color: #111; color: #0f0; font-family: monospace; text-align: center; margin-top: 50px; }
-                        img { border: 2px solid #0f0; max-width: 100%; border-radius: 8px; }
-                        h1 { letter-spacing: 2px; }
-                    </style>
-                </head>
-                <body>
-                    <h1>TAC AUTONOMOUS HUD</h1>
-                    <img src="/stream" />
-                </body>
-            </html>
-            """
-            self.wfile.write(html.encode("utf-8"))
+            self.wfile.write(MJPEGStreamer._load_dashboard().encode("utf-8"))
+            return
+
+        if self.path == '/state':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            import json
+            with MJPEGStreamer.server_lock:
+                state_data = {
+                    "x": MJPEGStreamer.server_x,
+                    "y": MJPEGStreamer.server_y,
+                    "z": MJPEGStreamer.server_z,
+                    "r": MJPEGStreamer.server_r,
+                    "state": MJPEGStreamer.server_state,
+                    "err": MJPEGStreamer.server_err,
+                    "pipe": MJPEGStreamer.server_pipe,
+                }
+            self.wfile.write(json.dumps(state_data).encode("utf-8"))
             return
             
         if self.path != '/stream':
@@ -560,7 +590,7 @@ class TacAutonomous:
         time.sleep(1)
 
         # MANUAL mod
-        mode_id = self.master.mode_mapping()['MANUAL']
+        mode_id = self.master.mode_mapping()['STABILIZE']
         self.master.mav.set_mode_send(
             self.master.target_system,
             mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
@@ -671,6 +701,12 @@ class TacAutonomous:
         elif turn_ratio > 0.2:
             # Orta derece viraj: Yavaşla (Orantılı Fren)
             fwd_spd = int(fwd_spd * (1.0 - turn_ratio))
+
+        # Yön çevirme kontrolü (Eğer araç sağa dönmesi gerekirken sola dönüyorsa rev_r=True yapın)
+        if cfg.rev_x:
+            fwd_spd = -fwd_spd
+        if cfg.rev_r:
+            r = -r
 
         return fwd_spd, y, r
 
@@ -827,6 +863,14 @@ class TacAutonomous:
                     if cfg.stream_on:
                         with MJPEGStreamer.server_lock:
                             MJPEGStreamer.server_frame = vis.copy()
+                            with self._lock:
+                                MJPEGStreamer.server_x = self._last_x
+                                MJPEGStreamer.server_y = self._last_y
+                                MJPEGStreamer.server_z = self._last_z
+                                MJPEGStreamer.server_r = self._last_r
+                            MJPEGStreamer.server_state = self.state
+                            MJPEGStreamer.server_err = self.last_err
+                            MJPEGStreamer.server_pipe = (center is not None)
 
                     # Yerel ekran (SSH korumalı)
                     if cfg.show_display:
@@ -914,7 +958,7 @@ def parse_args():
     ap.add_argument("--dry-run",     action="store_true",
                     help="Pixhawk olmadan test modu (sahte MAVLink)")
     ap.add_argument("--flip",        type=int, default=None,
-                    help="Görüntü ters çevirme ekseni: -1 (Yatay+Dikey), 0 (Sadece Dikey), 1 (Sadece Yatay)")
+                    help="Görüntü ters çevirme ekseni: -1 (180 derece), 0 (Dikey), 1 (Yatay)")
     ap.add_argument("--video",       default="",
                     help="Kamera yerine video dosyası kullan")
     ap.add_argument("--aruco-dict",  default="ORIGINAL",
@@ -943,7 +987,13 @@ def main():
     cfg.stream_on       = not args.no_stream
     cfg.stream_port     = args.port
     cfg.dry_run         = args.dry_run
-    cfg.flip            = args.flip
+    
+    # Otomatik Flip Mantığı: Canlı kameraysa ters çevir, test videosu ise olduğu gibi bırak
+    if not args.video and args.flip is None:
+        cfg.flip = -1
+    else:
+        cfg.flip = args.flip
+
     cfg.video           = args.video
 
     try:
