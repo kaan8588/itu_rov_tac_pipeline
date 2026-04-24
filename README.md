@@ -164,6 +164,7 @@ stateDiagram-v2
 ### Durum Detayları
 
 #### `INIT` — Başlatma
+
 - Pixhawk'a seri bağlantı kurulur
 - MAVLink parametreleri ayarlanır:
   - `FS_PILOT_EN = 0` (pilot failsafe kapalı)
@@ -173,12 +174,14 @@ stateDiagram-v2
 - Mod: `MANUAL` olarak ayarlanır
 
 #### `ARM` — Motorları Çalıştır
+
 - 10 saniyelik timeout ile ARM komutu gönderilir
 - Sürekli heartbeat + `manual_control` gönderilir
 - `COMMAND_ACK` ve `STATUSTEXT` mesajları loglanır
 - Başarılı olursa `SEARCH`'e geçilir, başarısız olursa program sonlanır
 
 #### `SEARCH` — Boru Ara
+
 - Boru henüz görüntüde tespit edilmemiş
 - Araç yavaş ileri (`spd_search`) + yaw ile dönerek boru arar
 - Eğer daha önce bir köşe tespit edildiyse, köşe yönünde döner
@@ -186,6 +189,7 @@ stateDiagram-v2
 - **Boru tespit edildiğinde** → `FOLLOW`'a geçilir
 
 #### `FOLLOW` — Boru Takip Et ⭐
+
 - **Ana çalışma durumu** — zamanın büyük bölümü burada geçer
 - Boru merkezi ve açısı sürekli hesaplanır
 - Hata (`error`) üzerinden lateral (yanal) ve yaw düzeltmeleri uygulanır
@@ -194,16 +198,19 @@ stateDiagram-v2
 - **Boru sonu** → `pipe_end_cnt` artar, limit aşılırsa `SURFACE`'e geçer
 
 #### `MARKER` — (Tanımlı ama kullanılmıyor)
+
 - State sabiti tanımlı (`ST_MARKER`) ancak mevcut state machine'de bu duruma geçiş yok
 - Muhtemelen gelecekte marker'a yaklaşma/durdurma için ayrılmış
 
 #### `SURFACE` — Yüzeye Çık
+
 - Araç yukarı hareket eder (`spd_surface = -400` → z ekseni)
 - `surface_secs` (varsayılan 8 sn) boyunca yükselir
 - Süre dolunca `DONE`'a geçer
 - `surface_on_done = false` ise yüzeye çıkmadan doğrudan `DONE`'a geçer
 
 #### `DONE` — Görev Tamamlandı
+
 - Tüm motorlar durdurulur
 - Sonuçlar yazdırılır ve dosyaya kaydedilir
 - Ana döngüden çıkılır, DISARM komutu gönderilir
@@ -578,6 +585,7 @@ Arka planda çalışan ayrı bir thread, 50ms (20Hz) aralıkla:
 ```
 
 **Görsel elemanlar:**
+
 - Yeşil overlay: HSV maskesi
 - Yeşil kontur: Boru sınırı
 - Turuncu dikdörtgen: MinAreaRect
@@ -596,6 +604,7 @@ Arka planda çalışan ayrı bir thread, 50ms (20Hz) aralıkla:
 Görev tamamlandığında (SURFACE veya DONE durumuna geçişte):
 
 ### Terminal Çıktısı
+
 ```
 ====================================================
   TAC Challenge 2026 — PIPELINE INSPECTION
@@ -606,6 +615,7 @@ Görev tamamlandığında (SURFACE veya DONE durumuna geçişte):
 ```
 
 ### Dosya Çıktısı
+
 Aynı içerik `pipeline_result.txt` dosyasına yazılır (parametre ile değiştirilebilir).
 
 ---

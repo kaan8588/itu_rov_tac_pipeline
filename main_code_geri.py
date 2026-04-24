@@ -66,6 +66,8 @@ ST_FOLLOW  = "FOLLOW"
 ST_MARKER  = "MARKER"
 ST_SURFACE = "SURFACE"
 ST_DONE    = "DONE"
+ST_RETURN  = "RETURN"
+ST_HOME    = "HOME"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -239,7 +241,8 @@ def draw_debug(frame, mask, contour, rect, center, angle,
     STATE_COL = {
         ST_INIT: (180, 180, 180), ST_ARM: (255, 200, 0), ST_SEARCH: (0, 200, 255),
         ST_FOLLOW: (80, 220, 80), ST_MARKER: (0, 255, 200),
-        ST_SURFACE: (200, 100, 255), ST_DONE: (255, 255, 255)
+        ST_SURFACE: (200, 100, 255), ST_DONE: (255, 255, 255),
+        ST_RETURN: (255, 140, 0), ST_HOME: (0, 255, 255)
     }
     scol = STATE_COL.get(state, (200, 200, 200))
     ah = min(angle, 180 - angle)
@@ -358,6 +361,9 @@ class TacAutonomousNode(Node):
         self.detector        = build_aruco_detector(self.aruco_dict)
         self.clahe           = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
+        self.follow_start_time = None
+        self.follow_elapsed    = 0.0
+
         self.last_err        = 0
         self.last_angle      = 0.0
         self.pipe_lost_cnt   = 0
@@ -370,6 +376,12 @@ class TacAutonomousNode(Node):
         self._last_y         = 0
         self._last_r         = 0
         self._result_printed = False
+
+        self.move_log           = []
+        self._return_log        = []
+        self._return_idx        = 0
+        self._return_step_start = 0.0
+        self._last_frame_time   = time.time()
 
         self.get_logger().info("TacAutonomousNode başlatıldı")
 
@@ -434,6 +446,9 @@ class TacAutonomousNode(Node):
         # Display
         self.declare_parameter('no_display',       False)
         self.declare_parameter('publish_debug',    True)
+        self.declare_parameter('return_cx', 1.0)
+        self.declare_parameter('return_cy', 1.0)
+        self.declare_parameter('return_cr', 1.0)
 
     def _read_params(self):
         g = self.get_parameter
@@ -493,6 +508,9 @@ class TacAutonomousNode(Node):
 
         self.show_display   = not g('no_display').value
         self.publish_debug  = g('publish_debug').value
+        self.return_cx      = g('return_cx').value
+        self.return_cy      = g('return_cy').value
+        self.return_cr      = g('return_cr').value
 
     def _get_pipe_params(self):
         """detect_pipe ve draw_debug için parametre dict'i döndür."""
@@ -646,6 +664,14 @@ class TacAutonomousNode(Node):
     def _set_state(self, s):
         if s == self.state:
             return
+        if s == ST_FOLLOW:
+            self.follow_start_time = time.time()
+        elif self.state == ST_FOLLOW and s != ST_FOLLOW:
+            self.follow_elapsed += time.time() - (self.follow_start_time or time.time())
+        if s == ST_RETURN:
+            self._return_log        = list(reversed(self.move_log))
+            self._return_idx        = 0
+            self._return_step_start = time.time()
         self.get_logger().info(f"STATE: {self.state} → {s}")
         self.state   = s
         self.state_t = time.time()
@@ -741,7 +767,32 @@ class TacAutonomousNode(Node):
 
         # DONE
         if self.state == ST_DONE:
+            self._print_result(ordered)
+            self._set_state(ST_RETURN)
+            return
+
+        # RETURN
+        if self.state == ST_RETURN:
+            if self._return_idx >= len(self._return_log):
+                self.halt()
+                self._set_state(ST_HOME)
+                return
+            x, y, r, dt = self._return_log[self._return_idx]
+            self.move(
+                int(-x * self.return_cx),
+                int(-y * self.return_cy),
+                int(-r * self.return_cr)
+            )
+            if time.time() - self._return_step_start >= dt:
+                self._return_idx += 1
+                self._return_step_start = time.time()
+            return
+
+        # HOME
+        if self.state == ST_HOME:
             self.halt()
+            self.get_logger().info("Başlangıç noktasına dönüldü.")
+            return
 
     # ── Sonuç yazdır & kaydet ─────────────────────────────────
     def _print_result(self, ordered):
@@ -826,6 +877,12 @@ class TacAutonomousNode(Node):
                     cv2.rotate(raw, cv2.ROTATE_180),
                     (self.frame_w, self.frame_h))
 
+                now = time.time()
+                dt  = now - self._last_frame_time
+                self._last_frame_time = now
+                if self.state in (ST_SEARCH, ST_FOLLOW):
+                    self.move_log.append((self._last_x, self._last_y, self._last_r, dt))
+
                 # ── Pipe detection ────────────────────────────
                 mask, contour, center, rect, angle = detect_pipe(
                     frame, params)
@@ -834,17 +891,21 @@ class TacAutonomousNode(Node):
                     0 if center is not None
                     else self.pipe_lost_cnt + 1)
 
-                # ── ArUco detection ───────────────────────────
-                corners, ids = detect_aruco(
-                    frame, mask, self.detector, self.clahe)
-                if ids is not None and len(corners) > 0:
-                    # En yakın (y en büyük) marker'ı önce al
-                    centers_y = [int(c[0][:, 1].mean()) for c in corners]
-                    nearest_idx = max(range(len(centers_y)), key=lambda i: centers_y[i])
-                    ids_flat = [ids[nearest_idx][0]]
+                # ── ArUco detection ───────────────────────────────────────
+                if self.state not in (ST_RETURN, ST_HOME):
+                    corners, ids = detect_aruco(
+                        frame, mask, self.detector, self.clahe)
+                    if ids is not None and len(corners) > 0:
+                        centers_y = [int(c[0][:, 1].mean()) for c in corners]
+                        nearest_idx = max(range(len(centers_y)), key=lambda i: centers_y[i])
+                        ids_flat = [ids[nearest_idx][0]]
+                    else:
+                        ids_flat = []
+                    ordered = self.confirmer.update(ids_flat)
                 else:
-                    ids_flat = []                
-                ordered  = self.confirmer.update(ids_flat)
+                    corners, ids = [], None
+                    ids_flat = []
+                    ordered = self.confirmer.ordered
 
                 for mid in self.confirmer.new_ids:
                     self.get_logger().info(
@@ -853,14 +914,12 @@ class TacAutonomousNode(Node):
 
                 # ── State machine ─────────────────────────────
                 prev_state = self.state
-                if self.state != ST_DONE:
-                    self._state_machine(center, angle, ids_flat, ordered)
+                self._state_machine(center, angle, ids_flat, ordered)
 
                 if prev_state != ST_SURFACE and self.state == ST_SURFACE:
                     self._print_result(ordered)
 
-                if self.state == ST_DONE:
-                    self._print_result(ordered)
+                if self.state == ST_HOME:
                     break
 
                 # ── ROS2 publish ──────────────────────────────
